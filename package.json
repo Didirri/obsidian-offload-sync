@@ -1,0 +1,19 @@
+{
+  "name": "offload-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin syncing a vault to an Offload relay.",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "node test/headless.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "latest",
+    "typescript": "^5.4.5"
+  }
+}
