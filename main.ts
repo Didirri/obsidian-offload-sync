@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS: OffloadSettings = {
 
 const SNAPSHOT_FILE = "snapshot.bin";
 const ONDISK_FILE = "ondisk.json";
+const ACTOR_FILE = "actor.hex";
 // The one .obsidian file we optionally sync — stable and shareable, unlike
 // workspace.json (churns constantly) or the plugins folder (device-specific).
 const GRAPH_CONFIG = ".obsidian/graph.json";
@@ -67,7 +68,19 @@ export default class OffloadPlugin extends Plugin {
     await init({ module_or_path: wasmBinary });
 
     const snap = await this.loadSnapshot();
-    this.node = snap ? Node.restore(snap) : new Node();
+    const actorHex = await this.loadActor();
+    if (snap) {
+      this.node = Node.restore(snap); // restores device id + tree; chunks rebuilt from disk
+    } else if (actorHex) {
+      // No usable snapshot, but keep a STABLE device identity so a reload can
+      // never re-author the whole vault under a brand-new device.
+      this.node = Node.withActor(actorHex);
+    } else {
+      this.node = new Node();
+    }
+    // Persist the actor id separately — it's tiny, so it survives even when the
+    // snapshot can't be written. This is the invariant that prevents re-pollution.
+    await this.saveActor(this.node.actorHex());
     this.lastOnDisk = await this.loadOnDisk();
     this.ready = true;
 
@@ -371,6 +384,31 @@ export default class OffloadPlugin extends Plugin {
       );
     } catch (e) {
       console.error("Offload: failed to save on-disk index", e);
+    }
+  }
+
+  private actorPath(): string {
+    return `${this.manifest.dir}/${ACTOR_FILE}`;
+  }
+
+  private async loadActor(): Promise<string | null> {
+    try {
+      const p = this.actorPath();
+      if (await this.app.vault.adapter.exists(p)) {
+        const raw = (await this.app.vault.adapter.read(p)).trim();
+        if (/^[0-9a-f]{32}$/.test(raw)) return raw;
+      }
+    } catch (e) {
+      console.error("Offload: failed to load actor id", e);
+    }
+    return null;
+  }
+
+  private async saveActor(hex: string) {
+    try {
+      await this.app.vault.adapter.write(this.actorPath(), hex);
+    } catch (e) {
+      console.error("Offload: failed to save actor id", e);
     }
   }
 
