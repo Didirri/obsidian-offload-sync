@@ -52,9 +52,6 @@ export default class OffloadPlugin extends Plugin {
   private node: Node | null = null;
   private syncing = false;
   private ready = false;
-  // Paths this plugin has written to disk, so it can safely remove ones that
-  // later disappear from the tree without ever touching a pre-existing user file.
-  private materialized = new Set<string>();
   // Paths that were actually on disk at the end of the previous scan. A tree
   // file missing from disk is only treated as a real deletion if it was here;
   // otherwise it's an un-materialized file and its delete is suppressed. Persisted
@@ -240,8 +237,8 @@ export default class OffloadPlugin extends Plugin {
   /// visible and nothing is silently overwritten — exactly like the native app.
   /// Writes go through the Vault API so an open note updates cleanly instead of
   /// firing "modified externally, merging". Never rewrites a file whose bytes
-  /// already match, and only removes files this plugin itself wrote (to the
-  /// recoverable .trash, never a hard delete).
+  /// already match. Removes files that were on disk this scan but have left the
+  /// tree (deleted upstream) — to the recoverable .trash, never a hard delete.
   private async materialize() {
     const node = this.node!;
     const vault = this.app.vault;
@@ -276,7 +273,6 @@ export default class OffloadPlugin extends Plugin {
           ? new Uint8Array(await adapter.readBinary(localPath))
           : null;
         if (current && bytesEqual(current, bytes)) {
-          this.materialized.add(localPath);
           continue; // already current — leave the file (and any open editor) alone
         }
         const buf = toArrayBuffer(bytes);
@@ -305,25 +301,25 @@ export default class OffloadPlugin extends Plugin {
           }
           await vault.createBinary(localPath, buf);
         }
-        this.materialized.add(localPath);
       } catch (e) {
         console.error("Offload: failed to materialize " + localPath, e);
       }
     }
 
-    for (const p of Array.from(this.materialized)) {
-      if (!wantLocal.has(p)) {
-        // Never auto-remove config (e.g. after turning graph sync off) — just
-        // stop tracking it. Only vault content is trashed when it's gone upstream.
-        if (p.startsWith(".obsidian/")) {
-          this.materialized.delete(p);
-          continue;
-        }
-        const af = vault.getAbstractFileByPath(p);
-        if (af) await vault.trash(af, false); // recoverable local .trash, never a hard delete
-        else if (await adapter.exists(p)) await adapter.remove(p);
-        this.materialized.delete(p);
-      }
+    // Apply incoming deletes: anything that was on disk at this scan but is no
+    // longer in the desired tree was deleted upstream — remove it locally. Driven
+    // by the PERSISTED on-disk set (lastOnDisk), never in-memory state, so it
+    // survives the frequent plugin reloads on mobile. (The old in-memory tracker
+    // was wiped on reload, so a delete could be missed and then re-created by the
+    // next scan — resurrecting the file on every peer.)
+    for (const relayPath of this.lastOnDisk) {
+      if (prefix && !relayPath.startsWith(prefix)) continue;
+      const localPath = relayPath.slice(prefix.length);
+      if (!localPath || wantLocal.has(localPath)) continue;
+      if (localPath.startsWith(".obsidian/")) continue; // never auto-remove config
+      const af = vault.getAbstractFileByPath(localPath);
+      if (af) await vault.trash(af, false); // recoverable local .trash, never a hard delete
+      else if (await adapter.exists(localPath)) await adapter.remove(localPath);
     }
   }
 

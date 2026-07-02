@@ -1,7 +1,7 @@
 {
   "id": "offload-sync",
   "name": "Offload Sync",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "minAppVersion": "1.4.0",
   "description": "Sync this vault with your self-hosted Offload relay (content-addressed, resumable).",
   "author": "Road Noise",
