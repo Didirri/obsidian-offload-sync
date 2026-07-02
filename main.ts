@@ -13,16 +13,24 @@ interface OffloadSettings {
   // with its contents at the vault root (no nesting). Anything outside it is
   // left untouched on the relay.
   relaySubfolder: string;
+  // Opt in to syncing ONLY the graph view config (.obsidian/graph.json). All
+  // other .obsidian config (workspace, plugins, hotkeys, appearance) is always
+  // left device-local, so this never drags desktop plugins onto the phone.
+  syncGraphConfig: boolean;
 }
 
 const DEFAULT_SETTINGS: OffloadSettings = {
   relayUrl: "",
   intervalSeconds: 0,
   relaySubfolder: "",
+  syncGraphConfig: false,
 };
 
 const SNAPSHOT_FILE = "snapshot.bin";
 const ONDISK_FILE = "ondisk.json";
+// The one .obsidian file we optionally sync — stable and shareable, unlike
+// workspace.json (churns constantly) or the plugins folder (device-specific).
+const GRAPH_CONFIG = ".obsidian/graph.json";
 // Every Nth scan re-reads the whole vault instead of trusting the scancache, so a
 // file whose mtime+size happened not to change is still reconciled eventually.
 const FULL_SCAN_EVERY = 20;
@@ -190,6 +198,20 @@ export default class OffloadPlugin extends Plugin {
       if (st) stats.set(relayPath, st);
     }
 
+    // Optionally include the graph view config. Staged explicitly because
+    // getFiles() excludes all of .obsidian; only graph.json is ever synced.
+    if (this.settings.syncGraphConfig) {
+      try {
+        if (await adapter.exists(GRAPH_CONFIG)) {
+          const data = await adapter.readBinary(GRAPH_CONFIG);
+          node.stageFile(prefix + GRAPH_CONFIG, new Uint8Array(data));
+          currentOnDisk.add(prefix + GRAPH_CONFIG);
+        }
+      } catch (e) {
+        console.error("Offload: failed to stage graph.json", e);
+      }
+    }
+
     const tree = node.files() as Array<{ path: string; root: string; size: number }>;
     for (const f of deleteGuardPhantoms(tree, currentOnDisk, this.lastOnDisk)) {
       const bytes = node.readContent(f.root);
@@ -236,6 +258,13 @@ export default class OffloadPlugin extends Plugin {
       if (prefix && !f.path.startsWith(prefix)) continue;
       const localPath = f.path.slice(prefix.length);
       if (!localPath) continue;
+      // .obsidian config is device-local; only the opt-in graph.json is written.
+      if (
+        localPath.startsWith(".obsidian/") &&
+        !(this.settings.syncGraphConfig && localPath === GRAPH_CONFIG)
+      ) {
+        continue;
+      }
       wantLocal.add(localPath);
       // Per-file so one failed write can't abort the whole cycle and leave the
       // rest of the tree un-materialized. Files that fail here simply stay a gap;
@@ -252,7 +281,12 @@ export default class OffloadPlugin extends Plugin {
         }
         const buf = toArrayBuffer(bytes);
         const existing = vault.getAbstractFileByPath(localPath);
-        if (existing instanceof TFile) {
+        if (localPath.startsWith(".obsidian/")) {
+          // Config isn't a tracked vault file — write it through the adapter.
+          const dir = localPath.split("/").slice(0, -1).join("/");
+          if (dir && !(await adapter.exists(dir))) await adapter.mkdir(dir);
+          await adapter.writeBinary(localPath, buf);
+        } else if (existing instanceof TFile) {
           await vault.modifyBinary(existing, buf); // editor-aware update
         } else if (existing) {
           console.error("Offload: refusing to overwrite non-file at " + localPath);
@@ -279,6 +313,12 @@ export default class OffloadPlugin extends Plugin {
 
     for (const p of Array.from(this.materialized)) {
       if (!wantLocal.has(p)) {
+        // Never auto-remove config (e.g. after turning graph sync off) — just
+        // stop tracking it. Only vault content is trashed when it's gone upstream.
+        if (p.startsWith(".obsidian/")) {
+          this.materialized.delete(p);
+          continue;
+        }
         const af = vault.getAbstractFileByPath(p);
         if (af) await vault.trash(af, false); // recoverable local .trash, never a hard delete
         else if (await adapter.exists(p)) await adapter.remove(p);
@@ -385,6 +425,20 @@ class OffloadSettingTab extends PluginSettingTab {
             this.plugin.settings.relaySubfolder = v.trim();
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(containerEl)
+      .setName("Sync graph settings")
+      .setDesc(
+        "Also sync the graph view config (.obsidian/graph.json) — colours, groups, " +
+          "filters, forces. All other config (workspace, plugins, hotkeys) stays " +
+          "device-local. Reopen the graph after a sync to see changes."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncGraphConfig).onChange(async (v) => {
+          this.plugin.settings.syncGraphConfig = v;
+          await this.plugin.saveSettings();
+        })
       );
 
     new Setting(containerEl)
