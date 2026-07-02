@@ -8,11 +8,17 @@ import { syncOnce, deleteGuardPhantoms } from "./sync.mjs";
 interface OffloadSettings {
   relayUrl: string;
   intervalSeconds: number;
+  // Optional relay subtree to mirror into THIS vault. "" = the whole relay.
+  // e.g. "Didirri Mind" makes this vault mirror only that folder of the relay,
+  // with its contents at the vault root (no nesting). Anything outside it is
+  // left untouched on the relay.
+  relaySubfolder: string;
 }
 
 const DEFAULT_SETTINGS: OffloadSettings = {
   relayUrl: "",
   intervalSeconds: 0,
+  relaySubfolder: "",
 };
 
 const SNAPSHOT_FILE = "snapshot.bin";
@@ -133,16 +139,27 @@ export default class OffloadPlugin extends Plugin {
     }
   }
 
-  /// Author local edits: stage every vault file, then diff against the tree.
-  /// Unchanged files (same mtime+size as last scan) are staged by content
-  /// identity, so an idle vault re-reads and re-chunks nothing. A tree file that
-  /// is missing from disk is only allowed to author a delete if it was genuinely
-  /// on disk last time (in lastOnDisk); otherwise it is a not-yet-materialized
-  /// file and its content is re-staged so no spurious delete is authored. See
+  // The relay-path prefix for this vault ("" = whole relay), with a trailing
+  // slash. All node/relay paths are `prefix + <vault-relative path>`; disk IO
+  // uses the vault-relative path. This is what lets one vault mirror just a
+  // subtree of the relay (e.g. "Didirri Mind/") with its contents at the root.
+  private relayPrefix(): string {
+    const p = this.settings.relaySubfolder.trim().replace(/^\/+|\/+$/g, "");
+    return p ? p + "/" : "";
+  }
+
+  /// Author local edits: stage every vault file (under the relay prefix), then
+  /// diff against the tree. Unchanged files (same mtime+size as last scan) are
+  /// staged by content identity, so an idle vault re-reads and re-chunks nothing.
+  /// A tree file missing from disk only authors a delete if it was genuinely on
+  /// disk last time (in lastOnDisk); otherwise its content is re-staged so no
+  /// spurious delete is authored. This also protects everything OUTSIDE the
+  /// prefix (other vaults' subtrees) — never on this disk, so never deleted. See
   /// deleteGuardPhantoms in sync.mjs.
   private async scanVault() {
     const node = this.node!;
     const adapter = this.app.vault.adapter;
+    const prefix = this.relayPrefix();
     const currentOnDisk = new Set<string>();
     const stats = new Map<string, { mtime: number; size: number }>();
     // Periodically ignore the cache and re-read everything, as insurance against
@@ -152,6 +169,7 @@ export default class OffloadPlugin extends Plugin {
 
     node.beginScan();
     for (const file of this.app.vault.getFiles()) {
+      const relayPath = prefix + file.path;
       let st: { mtime: number; size: number } | null = null;
       try {
         const s = await adapter.stat(file.path);
@@ -159,35 +177,35 @@ export default class OffloadPlugin extends Plugin {
       } catch {
         /* fall through to a full read */
       }
-      const cached = this.scanCache.get(file.path);
+      const cached = this.scanCache.get(relayPath);
       let staged = false;
       if (!fullScan && st && cached && cached.mtime === st.mtime && cached.size === st.size) {
-        staged = node.stageUnchanged(file.path, cached.root);
+        staged = node.stageUnchanged(relayPath, cached.root);
       }
       if (!staged) {
         const data = await adapter.readBinary(file.path);
-        node.stageFile(file.path, new Uint8Array(data));
+        node.stageFile(relayPath, new Uint8Array(data));
       }
-      currentOnDisk.add(file.path);
-      if (st) stats.set(file.path, st);
+      currentOnDisk.add(relayPath);
+      if (st) stats.set(relayPath, st);
     }
 
     const tree = node.files() as Array<{ path: string; root: string; size: number }>;
     for (const f of deleteGuardPhantoms(tree, currentOnDisk, this.lastOnDisk)) {
       const bytes = node.readContent(f.root);
-      if (bytes) node.stageFile(f.path, bytes); // suppress spurious delete
+      if (bytes) node.stageFile(f.path, bytes); // suppress spurious delete (relay path)
     }
     node.commitScan(Date.now());
 
-    // Refresh the scancache from the freshly committed tree (path -> content root).
+    // Refresh the scancache from the freshly committed tree (relay path -> root).
     const rootByPath = new Map<string, string>();
     for (const f of node.files() as Array<{ path: string; root: string }>) {
       rootByPath.set(f.path, f.root);
     }
     const next = new Map<string, { mtime: number; size: number; root: string }>();
-    for (const [path, st] of stats) {
-      const root = rootByPath.get(path);
-      if (root) next.set(path, { mtime: st.mtime, size: st.size, root });
+    for (const [relayPath, st] of stats) {
+      const root = rootByPath.get(relayPath);
+      if (root) next.set(relayPath, { mtime: st.mtime, size: st.size, root });
     }
     this.scanCache = next;
 
@@ -206,37 +224,44 @@ export default class OffloadPlugin extends Plugin {
     const node = this.node!;
     const vault = this.app.vault;
     const adapter = vault.adapter;
+    const prefix = this.relayPrefix();
     const want = node.files() as Array<{ path: string; root: string; size: number }>;
     const forks = node.forks() as Array<{ path: string; root: string; size: number }>;
     const desired = [...want, ...forks];
-    const wantPaths = new Set(desired.map((f) => f.path));
+    const wantLocal = new Set<string>(); // vault-relative paths we want on disk
 
     for (const f of desired) {
+      // Map the relay path into this vault; skip anything outside our subfolder
+      // (it belongs to another vault and must be left untouched on the relay).
+      if (prefix && !f.path.startsWith(prefix)) continue;
+      const localPath = f.path.slice(prefix.length);
+      if (!localPath) continue;
+      wantLocal.add(localPath);
       // Per-file so one failed write can't abort the whole cycle and leave the
       // rest of the tree un-materialized. Files that fail here simply stay a gap;
       // the delete-safety guard keeps the scan from turning that gap into a delete.
       try {
         const bytes = node.readContent(f.root);
         if (!bytes) continue;
-        const current = (await adapter.exists(f.path))
-          ? new Uint8Array(await adapter.readBinary(f.path))
+        const current = (await adapter.exists(localPath))
+          ? new Uint8Array(await adapter.readBinary(localPath))
           : null;
         if (current && bytesEqual(current, bytes)) {
-          this.materialized.add(f.path);
+          this.materialized.add(localPath);
           continue; // already current — leave the file (and any open editor) alone
         }
         const buf = toArrayBuffer(bytes);
-        const existing = vault.getAbstractFileByPath(f.path);
+        const existing = vault.getAbstractFileByPath(localPath);
         if (existing instanceof TFile) {
           await vault.modifyBinary(existing, buf); // editor-aware update
         } else if (existing) {
-          console.error("Offload: refusing to overwrite non-file at " + f.path);
+          console.error("Offload: refusing to overwrite non-file at " + localPath);
           continue;
-        } else if (await adapter.exists(f.path)) {
+        } else if (await adapter.exists(localPath)) {
           // On disk but not in Obsidian's index yet — a raw write is the safe fallback.
-          await adapter.writeBinary(f.path, buf);
+          await adapter.writeBinary(localPath, buf);
         } else {
-          const dir = f.path.split("/").slice(0, -1).join("/");
+          const dir = localPath.split("/").slice(0, -1).join("/");
           if (dir && !vault.getAbstractFileByPath(dir)) {
             try {
               await vault.createFolder(dir);
@@ -244,16 +269,16 @@ export default class OffloadPlugin extends Plugin {
               /* already exists / raced */
             }
           }
-          await vault.createBinary(f.path, buf);
+          await vault.createBinary(localPath, buf);
         }
-        this.materialized.add(f.path);
+        this.materialized.add(localPath);
       } catch (e) {
-        console.error("Offload: failed to materialize " + f.path, e);
+        console.error("Offload: failed to materialize " + localPath, e);
       }
     }
 
     for (const p of Array.from(this.materialized)) {
-      if (!wantPaths.has(p)) {
+      if (!wantLocal.has(p)) {
         const af = vault.getAbstractFileByPath(p);
         if (af) await vault.trash(af, false); // recoverable local .trash, never a hard delete
         else if (await adapter.exists(p)) await adapter.remove(p);
@@ -340,6 +365,24 @@ class OffloadSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.relayUrl)
           .onChange(async (v) => {
             this.plugin.settings.relayUrl = v.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Relay subfolder")
+      .setDesc(
+        "Optional. Mirror only this folder of the relay into this vault, with its " +
+          "contents at the vault root (e.g. 'Didirri Mind'). Leave blank for the whole " +
+          "relay. IMPORTANT: set this on a FRESH empty vault before the first sync — " +
+          "changing it on a vault that already has files will misplace them."
+      )
+      .addText((t) =>
+        t
+          .setPlaceholder("(whole relay)")
+          .setValue(this.plugin.settings.relaySubfolder)
+          .onChange(async (v) => {
+            this.plugin.settings.relaySubfolder = v.trim();
             await this.plugin.saveSettings();
           })
       );
